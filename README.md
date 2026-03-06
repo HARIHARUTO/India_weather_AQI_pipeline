@@ -1,6 +1,51 @@
 # India AQI Weather Pipeline
 
-API-driven data engineering project that correlates Indian city AQI with weather conditions using BigQuery, dbt, and Airflow.
+India has a documented air quality crisis, but raw AQI and weather data are split across systems and formats.  
+This project builds an API-first data platform to answer a practical question:
+does rainfall, wind, and humidity materially improve city AQI, and for how long?
+
+## Problem Statement
+
+The pipeline correlates hourly AQI readings from government monitoring stations with weather conditions to produce analytics tables, quality metrics, and dashboard outputs that are reproducible and operationally monitored.
+
+## Proof It Works
+
+- Airflow DAG runs are completing end-to-end with all tasks green.
+- dbt stages, marts, and tests execute inside Airflow successfully.
+- BigQuery loads both valid and quarantined records on each ingestion run.
+
+Recent successful run IDs:
+
+- `manual__2026-03-06T06:37:30+00:00`
+- `manual__2026-03-06T06:44:47+00:00`
+- `manual__2026-03-06T06:48:30.343437+00:00`
+- `manual__2026-03-06T06:49:22+00:00`
+
+Artifacts to add:
+
+- Airflow green DAG screenshot: `docs/screenshots/airflow_dag_green.png`
+- dbt test output screenshot: `docs/screenshots/dbt_test_pass.png`
+- BigQuery row-count screenshot: `docs/screenshots/bigquery_row_counts.png`
+- Looker Studio dashboard URL: `TODO_ADD_LINK`
+
+## Architecture
+
+```mermaid
+flowchart LR
+  A[data.gov.in AQI API] --> C[Python Ingestion + Schema Validation]
+  B[OpenWeather API] --> C
+  C --> D[BigQuery raw_aqi]
+  D --> E[dbt Staging]
+  E --> F[dbt Intermediate]
+  F --> G[dbt Marts + Features]
+  G --> H[Looker Studio]
+  I[Airflow DAG] --> C
+  I --> E
+  I --> F
+  I --> G
+```
+
+If you want a static diagram image, export and place it at `docs/architecture.png`.
 
 ## What It Does
 
@@ -12,9 +57,32 @@ API-driven data engineering project that correlates Indian city AQI with weather
 6. Runs quality tests and pipeline-health metrics.
 7. Orchestrates the full flow in Airflow.
 
-## Architecture
+## Data Sources and Real-World Data Issues
 
-AQI API + Weather API -> Python ingestion + validation -> BigQuery raw -> dbt models -> Airflow orchestration -> Looker Studio
+AQI API (data.gov.in):
+
+- Pollutant-wise rows, not one wide row per station-hour.
+- `last_update` requires timestamp parsing and normalization.
+- Missing/invalid values appear and must be quarantined.
+
+Weather API (OpenWeatherMap):
+
+- City-level weather snapshot per fetch.
+- Rain key is optional (`rain.1h` missing on non-rain events).
+- City names may not exactly match AQI city naming; mapping is required.
+
+## Challenges and Fixes
+
+- Scraping instability pivot:
+  scraper approach was dropped in favor of API-only ingestion for reliability and compliance.
+- Docker credential visibility:
+  mounted `credentials.json` into Airflow containers and used container path for ADC.
+- Timestamp join mismatch:
+  truncated timestamps to hour (`DATE_TRUNC`) before AQI-weather join.
+- Backfill restartability:
+  added checkpoint file flow (`completed_dates.txt`) to resume interrupted backfills.
+- Queued runs confusion:
+  documented that `None` task states usually indicate queued runs under `max_active_runs=1`.
 
 ## Tech Stack
 
@@ -44,6 +112,12 @@ dbt_project/
 scripts/
   backfill_aqi.py
   backfill_weather.py
+docs/
+  ERRORS.md
+  DECISIONS.md
+  LEARNINGS.md
+  PRODUCTION_GAPS.md
+  DEVLOG.md
 data/
   cities.json
 docker-compose.yml
@@ -81,13 +155,13 @@ docker compose exec airflow-webserver airflow dags trigger india_aqi_weather_pip
 docker compose exec airflow-webserver airflow dags list-runs -d india_aqi_weather_pipeline --no-backfill
 ```
 
-To inspect a specific run, use the actual run id from `list-runs`:
+Inspect a specific run:
 
 ```bash
 docker compose exec airflow-webserver airflow tasks states-for-dag-run india_aqi_weather_pipeline manual__2026-03-06T05:31:48+00:00
 ```
 
-PowerShell helper to fetch latest running run and task states:
+PowerShell helper (latest running run):
 
 ```powershell
 $rid=(docker compose exec airflow-webserver airflow dags list-runs -d india_aqi_weather_pipeline --no-backfill | Select-String "running" | Select-Object -First 1).ToString().Split("|")[1].Trim(); Write-Host "RunId=$rid"; docker compose exec airflow-webserver airflow tasks states-for-dag-run india_aqi_weather_pipeline $rid
@@ -113,17 +187,12 @@ Airflow UI: `http://localhost:8080` (`airflow` / `airflow`)
 - dbt tests for nulls, category validity, future timestamps, and freshness.
 - Mart-level quality metrics via `mart_data_quality_metrics`.
 
-## Warehouse Optimizations
+## Production Improvements
 
-- Marts are materialized as BigQuery tables for predictable query performance.
-- Time-series marts are partitioned:
-  - `mart_city_aqi_trends` by `reading_date`
-  - `mart_pollutant_breakdown` by `reading_date`
-  - `mart_rain_impact` by `rain_event_date`
-  - `mart_pipeline_health` by `run_timestamp`
-  - `mart_data_quality_metrics` by `run_timestamp`
-  - `features_city_air_quality` by `reading_hour`
-- City-heavy marts are clustered by `canonical_city` for better pruning.
+- Use dbt incremental models for large historical volumes.
+- Move secrets to GCP Secret Manager instead of local file mounting.
+- Add Slack/email alerting for task failures and quality threshold breaches.
+- Publish dbt docs with model and column lineage.
 
 ## Backfill
 
@@ -138,16 +207,3 @@ Weather:
 ```bash
 python scripts/backfill_weather.py --start 2024-01-01 --end 2024-03-01
 ```
-
-## Current Status
-
-- End-to-end Airflow DAG runs are passing.
-- Local ingestion + dbt run/test are passing.
-- Project has been migrated from scraper-based approach to API-only ingestion.
-
-## Recent Ops Notes (2026-03-06)
-
-- Multiple manual triggers created queued runs due to `max_active_runs=1`.
-- `ingest_aqi_data` showed `SIGTERM` once because scheduler/webserver restart interrupted the task; subsequent retries/runs succeeded.
-- Seeing all task states as `None` usually means the run is still queued and not yet picked by scheduler.
-- Current live behavior is healthy: ingestion -> dbt seed/run/test -> log summary completes successfully.
